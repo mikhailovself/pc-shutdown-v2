@@ -170,7 +170,8 @@
   }
 
   // ---------- панель ----------
-  const S = { me: null, dev: null, st: null, offset: 0, delay: 15, running: false, polling: false, polls: 0, busy: false, lastCmd: null, err: null, ui: null };
+  const S = { me: null, dev: null, st: null, offset: 0, delay: 15, running: false, checking: false, polls: 0, busy: false, lastCmd: null, err: null, ui: null,
+    es: null, live: false, fb: null, lastCheck: 0, backoff: 2000 };
   const PRESETS = [[0, 'Сразу'], [5, '5 мин'], [15, '15 мин'], [30, '30 мин'], [60, '1 час'], [120, '2 часа']];
   const ACKS = {
     queued: 'Команда отправлена, ждём ответ ПК…', received: 'ПК принял команду.',
@@ -204,7 +205,7 @@
 
     const ui = S.ui = {};
     ui.title = devs.length > 1
-      ? h('select', { 'aria-label': 'Выбор ПК', onchange: (e) => { S.dev = e.target.value; store.set('dev', S.dev); S.st = null; S.lastCmd = null; paint(); poll(); } },
+      ? h('select', { 'aria-label': 'Выбор ПК', onchange: (e) => { S.dev = e.target.value; store.set('dev', S.dev); S.st = null; S.lastCmd = null; paint(); recheck(); openStream(); } },
         devs.map((d) => h('option', { value: d.id, text: d.name })))
       : h('h1', { text: devs[0].name });
     if (ui.title.tagName === 'SELECT') ui.title.value = S.dev;
@@ -251,6 +252,11 @@
     u.chips.forEach((c) => c.setAttribute('aria-checked', String(c.dataset.d === String(S.delay))));
     u.customRow.hidden = S.delay !== 'custom';
   }
+  /** Сколько ПК работает: считаем от момента включения (его ПК шлёт один раз), а не ждём свежего числа. */
+  function upNow(state) {
+    const now = Date.now() + S.offset;
+    return state.boot ? Math.max(0, (now - state.boot) / 1000) : state.up + Math.max(0, (now - state.t) / 1000);
+  }
   function paint() {
     const u = S.ui; if (!u || !S.me) return;
     const st = S.st;
@@ -258,13 +264,17 @@
     if (st && !S.err) {
       if (!st.online) { word = true; big = 'Не в сети'; cap = 'ПК выключен, спит или без интернета. Команды недоступны.'; }
       else {
-        timer = st.state.timer;
+        timer = st.state ? st.state.timer : null;   // state бывает пустым, пока ПК не прислал его после перерыва
         if (timer) {
           const left = timer.remaining - (Date.now() + S.offset - st.state.t) / 1000;
           kind = 'warn';
-          if (left <= 0) { word = true; big = 'Выполняется'; cap = timer.action === 'shutdown' ? 'ПК выключается.' : 'ПК уходит в сон.'; }
+          if (left <= 0) {
+            word = true; big = 'Выполняется'; cap = timer.action === 'shutdown' ? 'ПК выключается.' : 'ПК уходит в сон.';
+            // выключившийся ПК сам ничего не сообщит: через полминуты спросим у него ещё раз
+            if (!S.chkT) S.chkT = setTimeout(() => { S.chkT = null; recheck(); }, 25000);
+          }
           else { big = fmtClock(left); cap = (timer.action === 'shutdown' ? 'До выключения' : 'До сна') + (timer.source === 'phone' ? '. Задано с телефона.' : '. Задано на ПК.'); }
-        } else { kind = 'ok'; word = true; big = 'Включён'; cap = `Работает ${fmtUptime(st.state.up)}`; }
+        } else { kind = 'ok'; word = true; big = 'Включён'; cap = st.state && (st.state.boot || st.state.up > 0) ? `Работает ${fmtUptime(upNow(st.state))}` : 'ПК на связи'; }
       }
     } else if (S.err) { word = true; big = 'Нет связи'; }
     u.hero.dataset.s = kind;
@@ -307,34 +317,112 @@
     try {
       const r = await api('POST', 'control', 'command', { body: { device: S.dev, action, delay } });
       S.lastCmd = { id: r.id };
-      S.st = S.st && { ...S.st, ack: { id: r.id, status: 'queued' } };
+      S.st = S.st && { ...S.st, ack: { id: r.id, status: 'queued', t: Date.now() + S.offset } };
       toast(action === 'cancel' ? 'Отмена отправлена' : 'Команда отправлена');
+      // ПК должен ответить «принял» за секунды (через Ably); молчит -> проверяем, в сети ли он вообще
+      clearTimeout(S.ackT);
+      S.ackT = setTimeout(() => { const a = S.st && S.st.ack; if (a && a.id === r.id && a.status === 'queued') recheck(); }, 12000);
       setTimeout(refreshMe, 2500);
     } catch (e) { toast(e.message); } finally { S.busy = false; paint(); }
   }
 
-  // опрос статуса: пока приложение открыто, сервер просит ПК опрашивать чаще
-  function startPolling() { stopPolling(); S.running = true; S.polls = 0; poll(); S.tick = setInterval(paint, 1000); }
-  function stopPolling() { S.running = false; clearTimeout(S.pollT); clearInterval(S.tick); }
-  async function poll() {
-    clearTimeout(S.pollT);
-    if (!S.running || S.polling) return;
-    if (!document.hidden) {
-      S.polling = true;
-      try {
-        const r = await api('GET', 'control', 'status', { query: `&d=${encodeURIComponent(S.dev)}` });
-        S.st = r; S.offset = r.now - Date.now(); S.err = null;
-        if (++S.polls % 20 === 0) refreshMe();
-      } catch (e) {
-        if (e.status === 401) { S.polling = false; return welcomeView('Сессия закончилась. Отсканируйте QR на ПК ещё раз.'); }
-        if (e.status === 404) { S.polling = false; return refreshMe().then(panelView); }
-        S.err = e.message;
-      }
-      S.polling = false; paint();
-    }
-    if (S.running) S.pollT = setTimeout(poll, 3000);
+  // ---------- статус ПК ----------
+  // Телефон ничего не опрашивает. При открытии (и когда вы возвращаетесь на вкладку) — один запрос: сервер будит ПК
+  // и ждёт его ответа, так узнаём «в сети». Дальше состояние приходит само: сервер при каждом изменении
+  // (команда принята, таймер сменился, подтверждение) публикует его в канал Ably, а мы слушаем канал через EventSource.
+  // Если Ably не настроен или поток не работает, включается запасной опрос.
+  function startPolling() { stopPolling(); S.running = true; S.polls = 0; S.tick = setInterval(paint, 1000); recheck(); openStream(); }
+  function stopPolling() {
+    S.running = false; clearInterval(S.tick); clearTimeout(S.chkT); clearTimeout(S.ackT);
+    S.chkT = S.ackT = null; closeStream(); stopFallback();
   }
-  document.addEventListener('visibilitychange', () => { if (!document.hidden && S.running) poll(); });
+  /** Ответ на 401/404. true — экран уже сменился. */
+  function statusFailed(e) {
+    if (e.status === 401) { stopPolling(); welcomeView('Сессия закончилась. Отсканируйте QR на ПК ещё раз.'); return true; }
+    if (e.status === 404) { stopPolling(); refreshMe().then(panelView); return true; }
+    S.err = e.message; return false;
+  }
+  const newer = (a, b) => (a && (!b || (a.t || 0) >= (b.t || 0)) ? a : b || null);
+  async function fetchStatus(check) {
+    const dev = S.dev;
+    const r = await api('GET', 'control', 'status', { query: `&d=${encodeURIComponent(dev)}${check ? '&check=1' : ''}` });
+    if (dev !== S.dev) return;
+    const cur = S.st || {};
+    S.offset = r.now - Date.now(); S.err = null;
+    S.st = { online: r.online, state: r.online ? newer(r.state, cur.state) : null, ack: newer(r.ack, cur.ack), now: r.now };
+  }
+  /** «ПК в сети?» спрашиваем у самого ПК (check=1). Один запрос, сервер ждёт ответа ПК до ~6 с. */
+  async function recheck() {
+    if (!S.running || S.checking || document.hidden) return;
+    S.checking = true;
+    try { await fetchStatus(true); S.lastCheck = Date.now(); } catch (e) { if (statusFailed(e)) { S.checking = false; return; } }
+    S.checking = false; paint();
+  }
+  /** Сообщение из канала: { t, online?, state?, ack? }. Склеиваем с тем, что уже знаем. */
+  function applyMsg(d) {
+    if (!S.st) S.st = { online: false, state: null, ack: null };
+    const cur = S.st;
+    if (d.t) S.offset = d.t - Date.now();
+    S.st = { ...cur, online: cur.online || !!d.online,           // сообщения шлёт сервер только по данным живого ПК
+      state: d.state ? newer(d.state, cur.state) : cur.state, ack: d.ack ? newer(d.ack, cur.ack) : cur.ack };
+    S.err = null; paint();
+  }
+  function onStreamMessage(raw) {
+    let m; try { m = JSON.parse(raw); } catch { return; }
+    if (!m || m.name !== 'state') return;
+    let d = m.data;
+    if (typeof d === 'string') { try { d = JSON.parse(d); } catch { return; } }
+    if (d && typeof d === 'object') applyMsg(d);
+  }
+  function closeStream() { clearTimeout(S.rtT); if (S.es) { S.es.close(); S.es = null; } S.live = false; }
+  async function openStream() {
+    closeStream();
+    if (!S.running) return;
+    const dev = S.dev;
+    let info;
+    try { info = await api('GET', 'control', 'realtime', { query: `&d=${encodeURIComponent(dev)}` }); } catch (e) {
+      if (e.status === 401 || e.status === 404) return;            // recheck уже разберётся
+      startFallback(10000, false);
+      S.rtT = setTimeout(openStream, S.backoff = Math.min(60000, S.backoff * 2));
+      return;
+    }
+    if (!S.running || dev !== S.dev) return;
+    if (!info.enabled) return startFallback(3000, false);          // без Ably: опрос раз в 3 с, ПК в это время отвечает чаще
+    const es = new EventSource(info.url);
+    S.es = es;
+    es.onopen = () => {
+      S.live = true; S.backoff = 2000; stopFallback();
+      if (Date.now() - S.lastCheck > 8000) recheck();              // пока потока не было, могли пропустить события
+    };
+    es.addEventListener('message', (e) => onStreamMessage(e.data));
+    es.addEventListener('error', () => {
+      S.live = false;
+      startFallback(30000, true);                                  // потока нет: раз в 30 с спрашиваем ПК напрямую
+      if (es.readyState === 2) {                                   // браузер сдался (токен истёк и т. п.): берём новый токен
+        clearTimeout(S.rtT); S.rtT = setTimeout(openStream, S.backoff = Math.min(60000, S.backoff * 2));
+      }
+    });
+    // токен живёт час: за две минуты до конца переподключаемся с новым
+    S.rtT = setTimeout(openStream, Math.max(30000, info.expires - Date.now() - 120000));
+  }
+  function startFallback(ms, check) {
+    if (S.fb && S.fb.ms === ms && S.fb.check === check) return;
+    stopFallback(); S.fb = { ms, check }; S.pollT = setTimeout(pollTick, ms);
+  }
+  function stopFallback() { clearTimeout(S.pollT); S.fb = null; }
+  async function pollTick() {
+    if (!S.running || S.live || !S.fb) return;
+    if (!document.hidden) {
+      try { await fetchStatus(S.fb.check); if (++S.polls % 20 === 0) refreshMe(); } catch (e) { if (statusFailed(e)) return; }
+      paint();
+    }
+    if (S.running && !S.live && S.fb) S.pollT = setTimeout(pollTick, S.fb.ms);
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (!S.running) return;
+    if (document.hidden) { closeStream(); stopFallback(); return; }   // свёрнутый телефон не держит соединений
+    recheck(); openStream();
+  });
 
   function emptyView() {
     stopPolling();

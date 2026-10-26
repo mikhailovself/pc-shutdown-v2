@@ -2,8 +2,10 @@
   "name": "snooz-web",
   "private": true,
   "version": "2.1.0",
-  "description": "SNOOZ: управление сном и выключением ПК с телефона (Vercel + Upstash Redis)",
-  "engines": { "node": ">=20" },
+  "description": "SNOOZ: удалённое управление питанием ПК с телефона (Vercel + Upstash Redis, Ably необязательно)",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "test": "node --test test/e2e.test.js",
     "dev": "node test/dev-server.js"

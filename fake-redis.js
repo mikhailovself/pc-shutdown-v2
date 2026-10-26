@@ -40,8 +40,10 @@ function createStore() {
     EVAL: (script, n, ...rest) => {
       const keys = rest.slice(0, Number(n)), args = rest.slice(Number(n));
       if (cmds.HGET(keys[0], 'h') !== args[0]) return null;
-      cmds.SET(keys[1], args[1], 'EX', 60);
-      return [cmds.GETDEL(keys[2]), cmds.EXISTS(keys[3])];
+      const hot = cmds.EXISTS(keys[3]);
+      cmds.SET(keys[1], args[1], 'EX', hot ? args[3] : args[2]);
+      if (args[4] !== '') cmds.SET(keys[4], args[4], 'EX', 604800);
+      return [cmds.GETDEL(keys[2]), hot, cmds.EXISTS(keys[4])];
     },
   };
   const run = ([name, ...a]) => {

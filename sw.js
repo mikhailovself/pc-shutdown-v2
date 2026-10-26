@@ -1,6 +1,6 @@
 'use strict';
 // Кэшируем только оболочку приложения. Запросы к /api никогда не кэшируются.
-const CACHE = 'snooz-v3';
+const CACHE = 'snooz-v5';
 const SHELL = ['/', '/styles.css', '/app.js', '/manifest.webmanifest', '/icon.svg', '/icon-192.png'];
 
 self.addEventListener('install', (e) => {

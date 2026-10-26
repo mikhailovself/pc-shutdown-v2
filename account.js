@@ -3,7 +3,7 @@
 const L = require('./_lib');
 const { HttpError } = L;
 
-const devKeys = (did) => ['', ':state', ':cmd', ':ack', ':hot'].map((x) => `d:${did}${x}`);
+const devKeys = (did) => ['', ':alive', ':state', ':cmd', ':ack', ':hot'].map((x) => `d:${did}${x}`);
 
 async function dropSessions(uid, keep) {
   const sids = (await L.redis(['SMEMBERS', `u:${uid}:sess`])).filter((x) => x !== keep);
@@ -27,7 +27,7 @@ module.exports = L.api({
       ]);
       const devices = [];
       if (devs.length) {
-        const r = await L.pipeline(devs.flatMap((d) => [['HGET', `d:${d}`, 'name'], ['EXISTS', `d:${d}:state`]]));
+        const r = await L.pipeline(devs.flatMap((d) => [['HGET', `d:${d}`, 'name'], ['EXISTS', `d:${d}:alive`]]));
         devs.forEach((id, i) => { if (r[i * 2]) devices.push({ id, name: r[i * 2], online: !!r[i * 2 + 1] }); });
       }
       const sessions = [];

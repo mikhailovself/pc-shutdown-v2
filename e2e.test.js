@@ -219,3 +219,328 @@ test('rate-limit на создание кодов', async () => {
   for (let i = 0; i < 22; i++) last = await pc.call('POST', 'pair', 'start', { body: { name: 'x', secret: newSecret() } });
   assert.equal(last.status, 429);
 });
+
+// ───────────────────────── Ably (мгновенная доставка) ─────────────────────────
+const fakeAbly = require('./fake-ably');
+
+async function withAbly(fn) {
+  const ably = await fakeAbly.start();
+  const saved = { k: process.env.ABLY_API_KEY, h: process.env.ABLY_HOST };
+  process.env.ABLY_API_KEY = 'app123.key456:supersecret';
+  process.env.ABLY_HOST = ably.url;
+  try { await fn(ably); } finally {
+    if (saved.k === undefined) delete process.env.ABLY_API_KEY; else process.env.ABLY_API_KEY = saved.k;
+    if (saved.h === undefined) delete process.env.ABLY_HOST; else process.env.ABLY_HOST = saved.h;
+    ably.close();
+  }
+}
+const realtime = (pc, dev) => pc.call('POST', 'agent', 'realtime', { body: {}, headers: dev.auth, csrf: false });
+
+test('Ably: без ключа realtime выключен, опрос остаётся как раньше', async () => {
+  const phone = new Client(), pc = new Client();
+  const dev = await pairNewPc(phone);
+  const r = await realtime(pc, dev);
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.json, { enabled: false });
+  assert.equal((await beat(pc, dev)).json.next, 15);
+});
+
+test('Ably: токен — JWT с правом subscribe только на канал этого ПК', async () => {
+  await withAbly(async (ably) => {
+    const phone = new Client(), pc = new Client();
+    const dev = await pairNewPc(phone);
+    const r = await realtime(pc, dev);
+    assert.equal(r.status, 200);
+    assert.equal(r.json.enabled, true);
+    const u = new URL(r.json.url);
+    assert.equal(u.origin, ably.url);
+    assert.equal(u.pathname, '/sse');
+    assert.equal(u.searchParams.get('channels'), `snooz-${dev.did}`);
+    const [h, c, sig] = u.searchParams.get('accessToken').split('.');
+    const want = crypto.createHmac('sha256', 'supersecret').update(`${h}.${c}`).digest('base64url');
+    assert.equal(sig, want);
+    const head = JSON.parse(Buffer.from(h, 'base64url')), claims = JSON.parse(Buffer.from(c, 'base64url'));
+    assert.equal(head.alg, 'HS256');
+    assert.equal(head.kid, 'app123.key456');
+    assert.deepEqual(JSON.parse(claims['x-ably-capability']), { [`snooz-${dev.did}`]: ['subscribe'] });
+    assert.ok(claims.exp - claims.iat <= 3600 && claims.exp > Date.now() / 1000);
+    assert.ok(r.json.expires > Date.now());
+    assert.equal((await beat(pc, dev)).json.next, 600);  // с Ably heartbeat только страховка: раз в 10 минут
+  });
+});
+
+test('Ably: чужой/отозванный ПК токен не получает', async () => {
+  await withAbly(async () => {
+    const pc = new Client();
+    const bad = { auth: { authorization: `Device ${'x'.repeat(16)}.${newSecret()}` } };
+    assert.equal((await realtime(pc, bad)).status, 401);
+    assert.equal((await pc.call('POST', 'agent', 'realtime', { body: {}, csrf: false })).status, 401);
+    const phone = new Client();
+    const dev = await pairNewPc(phone);
+    const wrong = { auth: { authorization: `Device ${dev.did}.${newSecret()}` } };
+    assert.equal((await realtime(new Client(), wrong)).status, 401);
+  });
+});
+
+test('Ably: команда телефона будит ПК, а при сбое Ably всё равно доходит через опрос', async () => {
+  await withAbly(async (ably) => {
+    const phone = new Client(), pc = new Client();
+    const dev = await pairNewPc(phone);
+    await beat(pc, dev);
+
+    const sub = await realtime(pc, dev);
+    const events = [];
+    const ctl = new AbortController();
+    const resp = await fetch(sub.json.url, { signal: ctl.signal });
+    const reader = resp.body.getReader();
+    (async () => { try { for (;;) { const { value, done } = await reader.read(); if (done) break; events.push(Buffer.from(value).toString()); } } catch {} })();
+    await new Promise((r) => setTimeout(r, 100));
+
+    const cmd = await phone.call('POST', 'control', 'command', { body: { device: dev.did, action: 'sleep', delay: 3 } });
+    assert.equal(cmd.status, 200);
+    await new Promise((r) => setTimeout(r, 100));
+    const w = ably.published.filter((x) => x.channel === `snooz-${dev.did}`);
+    assert.equal(w.length, 1);
+    assert.equal(w[0].auth, 'Basic ' + Buffer.from('app123.key456:supersecret').toString('base64'));
+    assert.equal(w[0].msg.name, 'wake');
+    assert.ok(events.join('').includes('event: message'), 'подписчик должен получить сигнал');
+    ctl.abort();
+
+    // в сигнале нет самой команды: её ПК забирает из heartbeat
+    assert.equal((await beat(pc, dev)).json.command.action, 'sleep');
+
+    ably.state.failPublish = true;           // Ably лёг: команда всё равно ставится в очередь
+    const cmd2 = await phone.call('POST', 'control', 'command', { body: { device: dev.did, action: 'cancel' } });
+    assert.equal(cmd2.status, 200);
+    assert.equal((await beat(pc, dev)).json.command.action, 'cancel');
+  });
+});
+
+// ---------- состояние ПК шлётся только при изменениях ----------
+const rawBeat = (pc, dev, body) => pc.call('POST', 'agent', 'beat', { body, headers: dev.auth, csrf: false });
+const ttlOf = (key) => Math.round((srv.redis.store.data.get(key).exp - Date.now()) / 1000);
+const statusOf = (phone, dev) => phone.call('GET', 'control', 'status', { query: `&d=${dev.did}` });
+
+test('состояние: первый heartbeat без него просит прислать, потом хватает «я жив»', async () => {
+  const phone = new Client(), pc = new Client();
+  const dev = await pairNewPc(phone);
+  const boot = Date.now() - 3 * 3600 * 1000;
+
+  const b1 = await rawBeat(pc, dev, { ver: '2.1' });             // состояния на сервере ещё нет
+  assert.equal(b1.json.need, true);
+  assert.equal((await statusOf(phone, dev)).json.online, true);   // но «жив» уже есть
+  assert.equal((await statusOf(phone, dev)).json.state, null);
+
+  const timer = { action: 'sleep', remaining: 600, source: 'phone' };
+  const b2 = await rawBeat(pc, dev, { ver: '2.1', state: { boot, uptime: 1, timer } });
+  assert.equal(b2.json.need, false);
+
+  const b3 = await rawBeat(pc, dev, { ver: '2.1' });             // дальше только «я жив»
+  assert.equal(b3.json.need, false);
+  const st = (await statusOf(phone, dev)).json;
+  assert.equal(st.online, true);
+  assert.equal(st.state.timer.remaining, 600);
+  assert.equal(st.state.timer.action, 'sleep');
+  assert.equal(st.state.boot, boot);
+  assert.ok(Math.abs(st.state.up - 3 * 3600) < 5, 'время работы считается от момента включения');
+
+  const b4 = await rawBeat(pc, dev, { state: { boot, timer: null } });   // таймер отменили на ПК
+  assert.equal(b4.json.need, false);
+  assert.equal((await statusOf(phone, dev)).json.state.timer, null);
+});
+
+test('состояние: кривые данные не ломают сервер', async () => {
+  const phone = new Client(), pc = new Client();
+  const dev = await pairNewPc(phone);
+  await rawBeat(pc, dev, { state: { boot: 'x', uptime: -5, timer: { action: 'format', remaining: 1e12 } } });
+  const st = (await statusOf(phone, dev)).json;
+  assert.equal(st.state.timer, null);
+  assert.equal(st.state.boot, 0);
+  await rawBeat(pc, dev, { state: { boot: Date.now() + 3600e3 } });   // «будущее» тоже отбрасываем
+  assert.equal((await statusOf(phone, dev)).json.state.boot, 0);
+});
+
+test('«в сети» живёт дольше, пока телефон не смотрит, и коротко, пока смотрит', async () => {
+  const phone = new Client(), pc = new Client();
+  const dev = await pairNewPc(phone);
+  await rawBeat(pc, dev, { state: { boot: Date.now() - 1000, timer: null } });
+  const idle = ttlOf(`d:${dev.did}:alive`);
+  assert.ok(idle > 50 && idle <= 60, `без Ably ~60 с, а не ${idle}`);
+
+  await statusOf(phone, dev);                                    // телефон открыл приложение
+  await rawBeat(pc, dev, {});
+  const hot = ttlOf(`d:${dev.did}:alive`);
+  assert.ok(hot > 10 && hot <= 20, `пока телефон смотрит ~20 с, а не ${hot}`);
+  assert.ok(ttlOf(`d:${dev.did}:state`) > 86400, 'состояние хранится днями, а не секундами');
+});
+
+test('Ably: heartbeat редкий, «жив» переживает один пропуск, телефон не заставляет ПК частить', async () => {
+  await withAbly(async (ably) => {
+    const phone = new Client(), pc = new Client();
+    const dev = await pairNewPc(phone);
+    const b = await rawBeat(pc, dev, { state: { boot: Date.now() - 1000, timer: null } });
+    assert.equal(b.json.next, 600);
+    const ttl = ttlOf(`d:${dev.did}:alive`);
+    assert.ok(ttl > 920 && ttl <= 930, `с Ably ~930 с (интервал×1,5 + 30), а не ${ttl}`);
+
+    await statusOf(phone, dev);                                  // обычный статус никого не будит и не ставит «hot»
+    assert.equal(wakes(ably, dev).length, 0);
+    assert.ok(!srv.redis.store.data.has(`d:${dev.did}:hot`));
+    assert.equal((await rawBeat(pc, dev, {})).json.next, 600);   // ПК по-прежнему редкий
+  });
+});
+
+// ---------- проверка «в сети» по запросу ----------
+const wakes = (ably, dev) => ably.published.filter((x) => x.channel === `snooz-${dev.did}`);
+const checkOf = (phone, dev) => phone.call('GET', 'control', 'status', { query: `&d=${dev.did}&check=1` });
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+test('Ably: открытие телефона будит ПК и ждёт ответа: ответил -> «в сети»', async () => {
+  await withAbly(async (ably) => {
+    process.env.PING_STEP_MS = '30';
+    const phone = new Client(), pc = new Client();
+    const dev = await pairNewPc(phone);
+    await rawBeat(pc, dev, { state: { boot: Date.now() - 1000, timer: null } });
+    await wait(3100);                                            // отметка устарела (старше 3 с): нужен пинг
+    const p = checkOf(phone, dev);
+    await wait(200);
+    assert.equal(wakes(ably, dev).length, 1);
+    assert.equal(wakes(ably, dev)[0].msg.name, 'wake');
+    await rawBeat(pc, dev, {});                                  // ПК «проснулся» и отметился
+    const r = await p;
+    assert.equal(r.json.online, true);
+    assert.ok(r.json.state, 'состояние отдаётся вместе с ответом');
+    delete process.env.PING_STEP_MS;
+  });
+});
+
+test('Ably: ПК не ответил на пинг -> «не в сети», даже если старый heartbeat ещё «жив»', async () => {
+  await withAbly(async () => {
+    process.env.PING_STEP_MS = '30'; process.env.PING_WAIT_MS = '400';
+    const phone = new Client(), pc = new Client();
+    const dev = await pairNewPc(phone);
+    await rawBeat(pc, dev, { state: { boot: Date.now() - 1000, timer: null } });
+    assert.ok(ttlOf(`d:${dev.did}:alive`) > 900);                // по TTL ПК ещё «жив»
+    await wait(3100);
+    const t0 = Date.now();
+    const r = await checkOf(phone, dev);
+    assert.equal(r.json.online, false);
+    assert.equal(r.json.state, null);
+    assert.ok(Date.now() - t0 >= 400, 'ждали ответа');
+    delete process.env.PING_STEP_MS; delete process.env.PING_WAIT_MS;
+  });
+});
+
+test('Ably: свежая отметка (до 3 с) пинг не нужен; если Ably не принял сигнал, верим отметке', async () => {
+  await withAbly(async (ably) => {
+    const phone = new Client(), pc = new Client();
+    const dev = await pairNewPc(phone);
+    await rawBeat(pc, dev, {});
+    const r = await checkOf(phone, dev);
+    assert.equal(r.json.online, true);
+    assert.equal(wakes(ably, dev).length, 0, 'ПК только что отметился: будить незачем');
+    await wait(3100);
+    ably.state.failPublish = true;
+    const r2 = await checkOf(phone, dev);                        // позвонить не удалось -> ответ по последней отметке
+    assert.equal(r2.json.online, true);
+  });
+});
+
+test('Ably: пинг ограничен 12 раз в минуту на ПК', async () => {
+  await withAbly(async (ably) => {
+    process.env.PING_STEP_MS = '5'; process.env.PING_WAIT_MS = '20';
+    const phone = new Client(), pc = new Client();
+    const dev = await pairNewPc(phone);
+    await rawBeat(pc, dev, {});
+    await wait(3100);
+    for (let i = 0; i < 15; i++) await checkOf(phone, dev);
+    assert.equal(wakes(ably, dev).length, 12);
+    delete process.env.PING_STEP_MS; delete process.env.PING_WAIT_MS;
+  });
+});
+
+// ---------- состояние для телефона через Ably ----------
+test('Ably: токен телефона — subscribe только на каналы состояния его ПК', async () => {
+  await withAbly(async (ably) => {
+    const phone = new Client();
+    const dev = await pairNewPc(phone);
+    const stranger = new Client();
+    const other = await pairNewPc(stranger, 'Чужой ПК', '735190');
+    const r = await phone.call('GET', 'control', 'realtime');
+    assert.equal(r.status, 200);
+    assert.equal(r.json.enabled, true);
+    const u = new URL(r.json.url);
+    assert.equal(u.origin, ably.url);
+    assert.equal(u.searchParams.get('channels'), `snooz-${dev.did}-ui`);
+    const [h, c, sig] = u.searchParams.get('accessToken').split('.');
+    assert.equal(sig, crypto.createHmac('sha256', 'supersecret').update(`${h}.${c}`).digest('base64url'));
+    const claims = JSON.parse(Buffer.from(c, 'base64url'));
+    assert.deepEqual(JSON.parse(claims['x-ably-capability']), { [`snooz-${dev.did}-ui`]: ['subscribe'] });
+    assert.ok(!u.href.includes(other.did), 'чужой ПК в токене быть не должен');
+    const own = await phone.call('GET', 'control', 'realtime', { query: `&d=${dev.did}` });
+    assert.equal(new URL(own.json.url).searchParams.get('channels'), `snooz-${dev.did}-ui`);
+    assert.equal((await phone.call('GET', 'control', 'realtime', { query: `&d=${other.did}` })).status, 404, 'чужой ПК токен не получает');
+    assert.equal((await new Client().call('GET', 'control', 'realtime')).status, 401);
+  });
+});
+
+test('Ably: без ключа телефон получает enabled:false и опрашивает сам', async () => {
+  const phone = new Client();
+  await pairNewPc(phone);
+  assert.deepEqual((await phone.call('GET', 'control', 'realtime')).json, { enabled: false });
+});
+
+test('Ably: изменения (состояние, подтверждение, команда) уходят в канал телефона сами, обычный heartbeat молчит', async () => {
+  await withAbly(async (ably) => {
+    const phone = new Client(), pc = new Client();
+    const dev = await pairNewPc(phone);
+    const ui = () => ably.published.filter((x) => x.channel === `snooz-${dev.did}-ui`).map((x) => ({ name: x.msg.name, ...JSON.parse(x.msg.data) }));
+
+    await rawBeat(pc, dev, {});                                  // «я жив» без изменений: тишина
+    assert.equal(ui().length, 0);
+
+    const timer = { action: 'shutdown', remaining: 900, source: 'pc' };
+    await rawBeat(pc, dev, { state: { boot: Date.now() - 5000, timer } });
+    assert.equal(ui().length, 1);
+    assert.equal(ui()[0].name, 'state');
+    assert.equal(ui()[0].online, true);
+    assert.equal(ui()[0].state.timer.remaining, 900);
+    assert.ok(Math.abs(ui()[0].t - Date.now()) < 5000);
+
+    const cmd = await phone.call('POST', 'control', 'command', { body: { device: dev.did, action: 'sleep', delay: 5 } });
+    const after = ui();
+    assert.equal(after.length, 2);
+    assert.deepEqual([after[1].ack.id, after[1].ack.status], [cmd.json.id, 'queued']);
+    assert.ok(ably.published.some((x) => x.channel === `snooz-${dev.did}` && x.msg.name === 'wake'), 'ПК тоже разбужен');
+
+    await rawBeat(pc, dev, { ack: { id: cmd.json.id, status: 'received' } });
+    const last = ui().at(-1);
+    assert.equal(last.ack.status, 'received');
+    assert.equal(last.state, undefined, 'только подтверждение: состояние телефон возьмёт из прошлого сообщения');
+
+    await rawBeat(pc, dev, {});                                  // и снова тишина
+    assert.equal(ui().length, 3);
+  });
+});
+
+test('Ably: сигнал «проснись» не уходит в канал телефона, а состояние не будит ПК', async () => {
+  await withAbly(async (ably) => {
+    const phone = new Client(), pc = new Client();
+    const dev = await pairNewPc(phone);
+    await rawBeat(pc, dev, { state: { boot: Date.now() - 1000, timer: null } });
+    await phone.call('POST', 'control', 'command', { body: { device: dev.did, action: 'cancel' } });
+    for (const x of ably.published) {
+      assert.equal(x.channel.endsWith('-ui'), x.msg.name === 'state', `${x.channel}: ${x.msg.name}`);
+    }
+  });
+});
+
+test('удаление ПК стирает и «жив», и состояние', async () => {
+  const phone = new Client(), pc = new Client();
+  const dev = await pairNewPc(phone);
+  await rawBeat(pc, dev, { state: { boot: Date.now() - 1000, timer: null } });
+  assert.ok(srv.redis.store.data.has(`d:${dev.did}:alive`) && srv.redis.store.data.has(`d:${dev.did}:state`));
+  const rm = await phone.call('POST', 'account', 'removeDevice', { body: { device: dev.did, pin: '482916' } });
+  assert.equal(rm.status, 200);
+  assert.ok(!srv.redis.store.data.has(`d:${dev.did}:alive`) && !srv.redis.store.data.has(`d:${dev.did}:state`));
+});
